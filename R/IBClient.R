@@ -1,4 +1,4 @@
-IBClient <- R6::R6Class("IBClient",
+IBClient <- R6Class("IBClient",
 
   class=      FALSE,
   cloneable=  FALSE,
@@ -12,8 +12,6 @@ IBClient <- R6::R6Class("IBClient",
     serverTimestamp= NULL,  # Returned on connection
 
     Id=              NULL,  # Client ID
-
-    wrap=            NULL,  # Callbacks wrapper
 
     decoder=         NULL,  # Decoder
 
@@ -121,11 +119,6 @@ IBClient <- R6::R6Class("IBClient",
 
   public= list(
 
-    initialize= function(wrap) {
-
-      self$replaceWrap(wrap)
-    },
-
     connect= function(host="localhost", port=4002L, clientId=1L, connectOptions="", optionalCapabilities="") {
 
       stopifnot(is.null(private$socket))
@@ -145,7 +138,7 @@ IBClient <- R6::R6Class("IBClient",
 
       stopifnot(length(res)==2L)
 
-      cat("server version and timestamp:", res, "\n")
+      message("server version: ", res[1L], " timestamp: ", res[2L])
       private$serverVersion   <- as.integer(res[1L])
       private$serverTimestamp <- res[2L]
 
@@ -184,24 +177,13 @@ IBClient <- R6::R6Class("IBClient",
     },
 
     #
-    # Replace wrapper
-    #
-    replaceWrap= function(wrap) {
-
-      # Check if "wrap" is an IBWrap class
-      # TODO Improve this
-      stopifnot(exists("verifyAndAuthCompleted", wrap, mode="function", inherits=FALSE))
-
-      private$wrap <- wrap
-    },
-
-    #
     # Process server responses
     #
     # Block up to timeout
-    # Discard messages if flush=TRUE
+    # If wrap is missing, messages are discarded
+    # otherwise callbacks are dispatched
     #
-    checkMsg= function(timeout=0.2, flush=FALSE) {
+    checkMsg= function(wrap, timeout=0.2) {
 
       stopifnot(self$isOpen)
 
@@ -213,14 +195,14 @@ IBClient <- R6::R6Class("IBClient",
 
         msg <- private$readOneMsg()
 
-        if(!flush) {
+        if(!missing(wrap)) {
 
           # Decode message
           res <- private$decoder$decode(msg)
 
-          # Dispatch
+          # Dispatch callback
           if(!is.null(res))
-            do.call(private$wrap[[res$fname]], res$fargs)
+            do.call(wrap[[res$fname]], res$fargs)
         }
       }
 
@@ -275,16 +257,15 @@ IBClient <- R6::R6Class("IBClient",
 
       payload <- contract[c(1L:12L, 14L, 15L)]
 
-      payload <- c(payload, order[4L:9L])       # "action" through "tif"
+      payload <- c(payload, order[4L:9L]) # "action" -> "tif"
 
-      # Extended order fields
       payload <- c(payload, order[c("ocaGroup",
                                     "account",
                                     "openClose")],
 
                             map_enum2int("Origin", order$origin),
 
-                            order[14L:22L])     # "orderRef" through "hidden"
+                            order[14L:22L]) # "orderRef" -> "hidden"
 
       if(contract$secType == "BAG") {
 
@@ -305,15 +286,18 @@ IBClient <- R6::R6Class("IBClient",
                      pack_tagvalue(order$smartComboRoutingParams, mode="unfold"))
       }
 
-      payload <- c(payload, "",       # Deprecated sharesAllocation
+      payload <- c(payload, "", # Deprecated sharesAllocation
+
                             order[c("discretionaryAmt",
                                     "goodAfterTime",
                                     "goodTillDate",
                                     "faGroup",
                                     "faMethod",
-                                    "faPercentage",
-                                    "faProfile",
-                                    "modelCode",
+                                    "faPercentage")],
+
+      if(self$serVersion < MIN_SERVER_VER_FA_PROFILE_DESUPPORT) "", # Deprecated faProfile
+
+                            order[c("modelCode",
                                     "shortSaleSlot",
                                     "designatedLocation",
                                     "exemptCode",
@@ -324,9 +308,9 @@ IBClient <- R6::R6Class("IBClient",
                                     "minQty",
                                     "percentOffset")],
 
-                            FALSE,    # Deprecated eTradeOnly
-                            FALSE,    # Deprecated firmQuoteOnly
-                            "",       # Deprecated nbboPriceCap
+                            FALSE, # Deprecated eTradeOnly
+                            FALSE, # Deprecated firmQuoteOnly
+                            "",    # Deprecated nbboPriceCap
 
                             map_enum2int("AuctionStrategy", order$auctionStrategy),
 
@@ -342,7 +326,7 @@ IBClient <- R6::R6Class("IBClient",
                                     "deltaNeutralAuxPrice")])
 
       if(nzchar(order$deltaNeutralOrderType, keepNA=TRUE))
-        payload <- c(payload, order[58L:65L])
+        payload <- c(payload, order[54L:61L]) # "deltaNeutralConId" -> "deltaNeutralDesignatedLocation"
 
       payload <- c(payload, order[c("continuousUpdate",
                                     "referencePriceType",
@@ -353,7 +337,7 @@ IBClient <- R6::R6Class("IBClient",
                                     "scalePriceIncrement")])
 
       if(!is.na(order$scalePriceIncrement) && order$scalePriceIncrement > 0)
-        payload <- c(payload, order[73L:79L])
+        payload <- c(payload, order[69L:75L]) # "scalePriceAdjustValue" -> "scaleRandomPercent"
 
       payload <- c(payload, order[c("scaleTable",
                                     "activeStartTime",
@@ -428,26 +412,22 @@ IBClient <- R6::R6Class("IBClient",
                                     "usePriceMgmtAlgo",
                                     "duration",
                                     "postToAts",
-                                    "autoCancelParent")])
+                                    "autoCancelParent",
+                                    "advancedErrorOverride",
+                                    "manualOrderTime")])
 
-      if(self$serVersion >= MIN_SERVER_VER_ADVANCED_ORDER_REJECT)
-        payload <- c(payload, order$advancedErrorOverride)
+      if(contract$exchange == "IBKRATS")
+        payload <- c(payload, order$minTradeQty)
 
-      if(self$serVersion >= MIN_SERVER_VER_MANUAL_ORDER_TIME)
-        payload <- c(payload, order$manualOrderTime)
+      if(order$orderType == "PEG BEST")
+        payload <- c(payload, order[c("minCompeteSize",
+                                      "competeAgainstBestOffset")])
 
-      if(self$serVersion >= MIN_SERVER_VER_PEGBEST_PEGMID_OFFSETS) {
+      if(order$orderType == "PEG BEST" && order$competeAgainstBestOffset == Inf ||
+         order$orderType == "PEG MID")
+        payload <- c(payload, order[c("midOffsetAtWhole",
+                                      "midOffsetAtHalf")])
 
-        if(contract$exchange == "IBKRATS")
-          payload <- c(payload, order$minTradeQty)
-
-        if(order$orderType == "PEG BEST")
-          payload <- c(payload, order[c("minCompeteSize", "competeAgainstBestOffset")])
-
-        if(order$orderType == "PEG BEST" && order$competeAgainstBestOffset == Inf ||
-           order$orderType == "PEG MID")
-          payload <- c(payload, order[c("midOffsetAtWhole", "midOffsetAtHalf")])
-      }
 
       msg <- c(msg, id, private$sanitize(payload))
 
@@ -458,7 +438,7 @@ IBClient <- R6::R6Class("IBClient",
 
       msg <- c("4", "1", ### CANCEL_ORDER
                id,
-               if(self$serVersion >= MIN_SERVER_VER_MANUAL_ORDER_TIME) manualOrderCancelTime)
+               manualOrderCancelTime)
 
       private$encodeMsg(msg)
     },
@@ -490,7 +470,8 @@ IBClient <- R6::R6Class("IBClient",
 
       msg <- c("9", "8", ### REQ_CONTRACT_DATA
                reqId,
-               private$sanitize(contract[1L:15L]))
+               private$sanitize(contract[1L:15L]),
+               contract$issuerId)
 
       private$encodeMsg(msg)
     },
@@ -600,16 +581,6 @@ IBClient <- R6::R6Class("IBClient",
       payload <- c(subscription[1L:21L],
                    pack_tagvalue(scannerSubscriptionFilterOptions, mode="string"),
                    pack_tagvalue(scannerSubscriptionOptions, mode="string"))
-
-      # TODO: remove this?
-      # Check that NA's are only in allowed fields
-      idx <- which(is.na(payload))
-      stopifnot(names(payload)[idx] %in% c("numberOfRows", "abovePrice", "belowPrice",
-                                           "aboveVolume", "marketCapAbove", "marketCapBelow",
-                                           "couponRateAbove", "couponRateBelow",
-                                           "excludeConvertible", "averageOptionVolumeAbove"))
-      # Convert NA -> ""
-      payload[idx] <- ""
 
       msg <- c(msg, tickerId, private$sanitize(payload))
 
@@ -883,12 +854,7 @@ IBClient <- R6::R6Class("IBClient",
 
       msg <- c("102", ### REQ_WSH_EVENT_DATA
                reqId,
-               if(self$serVersion >= MIN_SERVER_VER_WSH_EVENT_DATA_FILTERS_DATE)
-                 private$sanitize(wshEventData)
-               else if(self$serVersion >= MIN_SERVER_VER_WSH_EVENT_DATA_FILTERS)
-                 private$sanitize(wshEventData[1L:5L])
-               else
-                 wshEventData$conId)
+               private$sanitize(wshEventData))
 
       private$encodeMsg(msg)
     },
